@@ -8140,6 +8140,9 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
     // "Most recently used" is not "the entry this request restored", and a restored entry's
     // shared buffers return nothing to the allocator when evicted.
     const s = mlx.gpuStream();
+    // Observe this test after earlier command-buffer completions and pool reuse.
+    try mlx.check(mlx.mlx_synchronize(s));
+    try mlx.check(mlx.mlx_clear_cache());
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer hc.deinit();
 
@@ -8162,6 +8165,8 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
         _ = try hc.commit(&cache, toks, false);
     }
     try testing.expectEqual(@as(usize, 3), hc.entryCount());
+    // eval waits for data; completion handlers may still retain the buffers.
+    try mlx.check(mlx.mlx_synchronize(s));
     var live_resident: usize = 0;
     _ = mlx.mlx_get_active_memory(&live_resident);
     try testing.expect(live_resident > 4 * 1024 * 1024);
@@ -8180,6 +8185,7 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
             return false;
         }
     };
+    try mlx.check(mlx.mlx_synchronize(s));
     const rep = hc.evictLruToAdmit(458_832, null, Never.call, true);
     try testing.expect(!rep.admitted);
     try testing.expectEqual(@as(usize, 2), rep.entries); // A and C, oldest first
@@ -8195,6 +8201,7 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
     try testing.expect(!rep.shared_stop);
 
     // Unprotected, B goes too, and the allocator gets ~nothing back, which the pass notices.
+    try mlx.check(mlx.mlx_synchronize(s));
     const rest = hc.evictLruToAdmit(458_832, null, Never.call, false);
     try testing.expect(!rest.admitted);
     try testing.expectEqual(@as(usize, 0), hc.entryCount());
