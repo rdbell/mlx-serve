@@ -363,7 +363,6 @@ pub const Bank = struct {
 /// in their place (they address experts from the buffer pointer): MLX bills
 /// a command buffer for each bound array's size, and a whole bank forced a
 /// commit at every kernel.
-
 /// `ext`: banks (w1, w3, w2) an outside quant plugin loaded and runs (the DSpark stages'); the MLX banks are then unset.
 pub const Experts = struct { gate: Bank, up: Bank, down: Bank, gu: ?Bank = null, views: ?[2]Bank = null, ext: ?[3]outside.Weight = null };
 pub const Layer = struct {
@@ -457,6 +456,8 @@ pub const Dsv41Model = struct {
     engrams: []EngramLayer = &.{},
     /// The request's prompt, whose later chunks' Engram rows are read while an earlier one runs.
     prompt: []u32 = &.{},
+    /// Identity of the state whose armed prompt owns `ahead`.
+    prompt_gen: u64 = 0,
     ahead: ?*engram.Prefetch = null,
     rope_plain: Rope,
     rope_yarn: Rope,
@@ -527,6 +528,14 @@ pub const Dsv41Model = struct {
     fn dropAhead(self: *Dsv41Model) void {
         if (self.ahead) |a| a.finish();
         self.ahead = null;
+    }
+
+    /// Cancels the armed prompt, joining its lookahead before releasing the tokens.
+    pub fn clearPrompt(self: *Dsv41Model) void {
+        self.dropAhead();
+        self.gpa.free(self.prompt);
+        self.prompt = &.{};
+        self.prompt_gen = 0;
     }
 
     pub fn deinit(self: *Dsv41Model) void {
@@ -3345,7 +3354,6 @@ pub fn attnSplits(rows: usize) c_int {
     return @intCast(@max(1, @min(8, rows / 160)));
 }
 
-
 /// `qt` (q_tail.zig): the heads' roped last channels [L, H, rope dims]; `q` is then the unroped heads.
 pub const Proj = struct { q: A, kv: A, qr: A, qt: A = none };
 /// Rows at `pos` -> the roped query heads, the window row (roped, fp8
@@ -4755,6 +4763,10 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
     const p0 = st.n;
     const L = ids.len;
     const p1 = p0 + L;
+    // A parked prompt keeps its own read-ahead even when another state reaches
+    // matching positions and tokens. Its own short final chunk can consume it.
+    const owner = if (m.dec_state) |*live| st == live and m.prompt_gen == m.state_gen else false;
+    if (!owner) return engram.Prefetch.start(gpa, tables, &.{.{ .at = p0, .len = L, .ids = rows }}, hs.cols(), span);
     const mine = p1 <= m.prompt.len and std.mem.eql(u32, ids, m.prompt[p0..p1]);
     const adopted: ?*engram.Prefetch = if (m.ahead) |a| if (mine and a.covers(p0, L)) a else null else null;
     errdefer if (adopted) |a| a.finish();
@@ -5677,7 +5689,6 @@ pub const region_rows = 16;
 
 /// With a streamed bank the FFN stretch runs as three (`ffn_pre`, `ffn_act`, `ffn_post`) around the source's host
 /// barrier, cut where `ffn` has no fusable op across the cut.
-
 pub const Region = enum { attn_in, q_kv, q_rows, attn_out, ffn, ffn_pre, ffn_act, ffn_post, ffn_shared, ffn_post_shared };
 const LayerRegions = struct {
     m: *Dsv41Model,
@@ -5853,6 +5864,7 @@ pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision:
 /// A fresh request's empty state.
 pub fn reset(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
     var fresh = try initState(m, gpa);
+    const armed = if (m.dec_state) |st| st.n == 0 and m.prompt_gen == m.state_gen else false;
     if (m.dec_state) |*st| {
         fresh.snap_at = st.snap_at;
         fresh.snap_ids = st.snap_ids;
@@ -5863,6 +5875,7 @@ pub fn reset(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
     }
     newGen(m);
     m.dec_state = fresh;
+    if (armed) m.prompt_gen = m.state_gen;
 }
 
 fn newGen(m: *Dsv41Model) void {
@@ -6203,10 +6216,9 @@ pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize
 
 /// Arms only this live State; candidate identity covers the boundary's ids and image rows.
 pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: bool) !void {
-    m.dropAhead();
-    m.gpa.free(m.prompt);
-    m.prompt = &.{};
+    m.clearPrompt();
     m.prompt = try m.gpa.dupe(u32, prompt);
+    m.prompt_gen = m.state_gen;
     const st = &m.dec_state.?;
     if (st.snap) |*sn| sn.deinit(st.gpa);
     st.snap = null;
@@ -8911,12 +8923,8 @@ test "dsv41 prefill: chunk time against depth (DSV41_PREFILL)" {
     // As `armPrompt` does for a served prompt: Engram reads each next chunk behind the running one.
     // DSV41_PREFILL_SERVED runs the server's own path: the armed prompt with its captures, `extendResumable`.
     const served = std.c.getenv("DSV41_PREFILL_SERVED") != null;
-    if (served) {
-        try reset(m, gpa);
-        try armPrompt(m, prompt, null, true);
-    } else m.prompt = try m.gpa.dupe(u32, prompt);
-    var st = try initState(m, gpa);
-    defer st.deinit();
+    try reset(m, gpa);
+    try armPrompt(m, prompt, null, served);
     const t_all = monoUs();
     var window_us: i64 = 0;
     var n_window: usize = 0;
@@ -8928,7 +8936,7 @@ test "dsv41 prefill: chunk time against depth (DSV41_PREFILL)" {
         _ = mlx.mlx_get_active_memory(&base);
         _ = mlx.mlx_reset_peak_memory();
         const piece = prompt[at..@min(ctx, at + chunk)];
-        const l = if (served) try extendResumable(m, gpa, piece, null) else try extend(m, gpa, &st, piece, .last);
+        const l = if (served) try extendResumable(m, gpa, piece, null) else try extend(m, gpa, &m.dec_state.?, piece, .last);
         try mlx.check(mlx.mlx_array_eval(l));
         _ = mlx.mlx_array_free(l);
         var peak: usize = 0;
@@ -9206,11 +9214,11 @@ test "dsv41 group: greedy DSpark group rounds against batched plain steps, by st
         const plain_ms = @as(f64, @floatFromInt(plain_us)) / rounds / 1000;
         const round_ms = @as(f64, @floatFromInt(us[0] + us[1] + us[2])) / rounds / 1000;
         std.debug.print("[group] ctx {d} states {d}: plain step {d:.2} ms = {d:.1} tok/s | round {d:.2} ms (draft {d:.2}, verify {d:.2} of {d:.1} rows, finish {d:.2}), {d:.2} tokens a state = {d:.1} tok/s\n", .{
-            ctx,                                                          n,
-            plain_ms,                                                     @as(f64, @floatFromInt(n)) * 1000 / plain_ms,
-            round_ms,                                                     @as(f64, @floatFromInt(us[0])) / rounds / 1000,
-            @as(f64, @floatFromInt(us[1])) / rounds / 1000,               @as(f64, @floatFromInt(rows)) / rounds,
-            @as(f64, @floatFromInt(us[2])) / rounds / 1000,               @as(f64, @floatFromInt(tokens)) / rounds / @as(f64, @floatFromInt(n)),
+            ctx,                                                        n,
+            plain_ms,                                                   @as(f64, @floatFromInt(n)) * 1000 / plain_ms,
+            round_ms,                                                   @as(f64, @floatFromInt(us[0])) / rounds / 1000,
+            @as(f64, @floatFromInt(us[1])) / rounds / 1000,             @as(f64, @floatFromInt(rows)) / rounds,
+            @as(f64, @floatFromInt(us[2])) / rounds / 1000,             @as(f64, @floatFromInt(tokens)) / rounds / @as(f64, @floatFromInt(n)),
             @as(f64, @floatFromInt(tokens)) * 1000 / rounds / round_ms,
         });
     }
@@ -10053,4 +10061,384 @@ test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name b
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
+}
+test "dsv41 engram interleave: calls preserve another state's lookahead, including matching positions and ids" {
+    const gpa = testing.allocator;
+    const width = region_rows + 1;
+    const prompt: [2 * width]u32 = @splat(7);
+    for ([_]usize{ 1, 4, region_rows, width }) |n| for ([_]usize{ 0, width, 262144 }) |position| for ([_]bool{ false, true }) |active_foreign| {
+        var m: Dsv41Model = undefined;
+        m.gpa = gpa;
+        m.dec_state = .{ .gpa = gpa, .layers = &.{}, .n = position };
+        defer m.dec_state.?.deinit();
+        m.state_gen = if (active_foreign) 2 else 1;
+        m.prompt_gen = 1;
+        m.hash = .{ .n_layers = 0, .max_ngram = 2, .heads = 1, .pad = 0 };
+        m.prompt = try gpa.dupe(u32, &prompt);
+        defer gpa.free(m.prompt);
+        m.ahead = try engram.Prefetch.start(gpa, &.{}, &.{.{ .at = width, .len = width, .ids = &.{} }}, 1, width);
+        defer m.dropAhead();
+        const ahead = m.ahead.?;
+        const prompt_ptr = m.prompt.ptr;
+        var other: State = .{ .gpa = gpa, .layers = &.{}, .n = position };
+        defer other.deinit();
+        const ids: [width]u32 = @splat(if (position == width) 7 else 9);
+        const current = try engramPrefetch(&m, gpa, if (active_foreign) &m.dec_state.? else &other, &.{}, ids[0..n], &.{}, width, false);
+        defer if (m.ahead != current) current.finish();
+        try testing.expect(m.ahead == ahead);
+        try testing.expect(current != ahead);
+        try testing.expect(m.prompt.ptr == prompt_ptr);
+        try testing.expectEqualSlices(u32, &prompt, m.prompt);
+        m.state_gen = 1;
+        m.dec_state.?.n = width;
+        const resumed = try engramPrefetch(&m, gpa, &m.dec_state.?, &.{}, prompt[width..], &.{}, width, false);
+        defer if (m.ahead != resumed) resumed.finish();
+        try testing.expect(resumed == ahead);
+        try testing.expect(m.ahead == null);
+    };
+}
+
+test "dsv41 engram interleave: a new prompt cancels retained lookahead without borrowing another slot's state" {
+    const gpa = testing.allocator;
+    const width = region_rows + 1;
+    const prompt: [2 * width]u32 = @splat(7);
+    var m: Dsv41Model = undefined;
+    m.gpa = gpa;
+    m.hash = .{ .n_layers = 0, .max_ngram = 2, .heads = 1, .pad = 0 };
+    m.prompt = try gpa.dupe(u32, &prompt);
+    defer gpa.free(m.prompt);
+    m.ahead = try engram.Prefetch.start(gpa, &.{}, &.{.{ .at = width, .len = width, .ids = &.{} }}, 1, width);
+    defer m.dropAhead();
+    m.dec_state = .{ .gpa = gpa, .layers = &.{} };
+    defer m.dec_state.?.deinit();
+    m.state_gen = 2;
+    m.prompt_gen = 1;
+    const ahead = m.ahead.?;
+    {
+        var other: State = .{ .gpa = gpa, .layers = &.{}, .n = width };
+        defer other.deinit();
+        const current = try engramPrefetch(&m, gpa, &other, &.{}, &.{7}, &.{}, width, false);
+        defer if (m.ahead != current) current.finish();
+        try testing.expect(m.ahead == ahead);
+    }
+    try testing.expect(m.ahead == ahead);
+    try armPrompt(&m, &.{ 8, 9, 10 }, null, false);
+    try testing.expect(m.ahead == null);
+    try testing.expectEqualSlices(u32, &.{ 8, 9, 10 }, m.prompt);
+    try testing.expectEqual(@as(u64, 2), m.state_gen);
+}
+
+test "dsv41 engram interleave: prefill and decode logits equal isolated states despite matching positions and tokens (DSV41_TINY)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const root = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    var t = try Tiny.open(root, "repack", "fixture.safetensors");
+    defer t.deinit();
+    const base = try t.ids();
+    defer gpa.free(base);
+    const m = t.m;
+    const width = region_rows + 1;
+    var prompt: [3 * width]u32 = undefined;
+    for (&prompt, 0..) |*id, k| id.* = base[k % base.len];
+    var other_prompt = prompt;
+    other_prompt[width - 1] = (other_prompt[width - 1] + 1) % @as(u32, @intCast(m.vocab));
+    for ([_]usize{ 1, 4, region_rows }) |n| {
+        var reference_decode: ?[]f32 = null;
+        defer if (reference_decode) |v| gpa.free(v);
+        var reference_prefill: ?[]f32 = null;
+        defer if (reference_prefill) |v| gpa.free(v);
+        for ([_]bool{ false, true }) |interleaved| {
+            m.dropAhead();
+            m.gpa.free(m.prompt);
+            m.prompt = &.{};
+            var other = try initState(m, gpa);
+            defer other.deinit();
+            const initial = try extend(m, gpa, &other, other_prompt[0..width], .last);
+            _ = mlx.mlx_array_free(initial);
+            if (!interleaved) {
+                const decoded = try extend(m, gpa, &other, prompt[width..][0..n], .all);
+                defer _ = mlx.mlx_array_free(decoded);
+                reference_decode = try hostF32(decoded);
+            }
+            try reset(m, gpa);
+            try armPrompt(m, &prompt, null, false);
+            const first = try extend(m, gpa, &m.dec_state.?, prompt[0..width], .last);
+            _ = mlx.mlx_array_free(first);
+            const ahead = m.ahead orelse return error.LookaheadMissing;
+            if (interleaved) {
+                const decoded = try extend(m, gpa, &other, prompt[width..][0..n], .all);
+                defer _ = mlx.mlx_array_free(decoded);
+                const got = try hostF32(decoded);
+                defer gpa.free(got);
+                try interleaveExactLogits(reference_decode.?, got);
+                try testing.expect(m.ahead == ahead);
+            }
+            const middle = try extend(m, gpa, &m.dec_state.?, prompt[width .. 2 * width], .last);
+            _ = mlx.mlx_array_free(middle);
+            const last = try extend(m, gpa, &m.dec_state.?, prompt[2 * width ..], .last);
+            defer _ = mlx.mlx_array_free(last);
+            const got = try hostF32(last);
+            if (!interleaved) reference_prefill = got else {
+                defer gpa.free(got);
+                try interleaveExactLogits(reference_prefill.?, got);
+            }
+        }
+    }
+}
+
+const InterleavePlugin = @import("plugin.zig");
+
+fn interleaveExactLogits(expected: []const f32, actual: []const f32) !void {
+    for (expected) |value| try testing.expect(std.math.isFinite(value));
+    for (actual) |value| try testing.expect(std.math.isFinite(value));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+}
+
+fn interleaveHost(m: *Dsv41Model, host: *InterleavePlugin.Model) void {
+    host.* = undefined;
+    host.mdl = m;
+    host.owner = 1;
+    host.parked = .empty;
+    host.idle = null;
+    host.bank_streams = false;
+    // begin_prompt/resume_prompt below must establish prompt ownership themselves.
+}
+
+fn interleaveCpuModel(m: *Dsv41Model, a: std.mem.Allocator) void {
+    m.* = undefined;
+    m.gpa = testing.allocator;
+    m.cfg = .{ .model_type = "deepseek_v41" };
+    m.hash = .{ .n_layers = 0, .max_ngram = 2, .heads = 1, .pad = 0 };
+    m.prompt = &.{};
+    m.ahead = null;
+    m.pair = null;
+    m.tp = null;
+    m.dec_state = .{ .gpa = a, .layers = &.{}, .n = region_rows + 1 };
+    m.state_gen = 1;
+    m.prompt_gen = 0;
+}
+
+fn interleaveHostCleanup(host: *InterleavePlugin.Model) void {
+    const m = host.mdl;
+    if (m.dec_state) |*st| st.deinit();
+    m.dec_state = null;
+    if (host.idle) |*kept| kept.st.deinit();
+    host.idle = null;
+    var it = host.parked.valueIterator();
+    while (it.next()) |kept| kept.st.deinit();
+    host.parked.deinit(std.heap.c_allocator);
+    host.parked = .empty;
+    m.dropAhead();
+    m.gpa.free(m.prompt);
+    m.prompt = &.{};
+}
+
+fn interleaveWaitForStop(pf: *engram.Prefetch, joined: *std.atomic.Value(bool)) void {
+    while (!pf.stop.load(.acquire)) std.Thread.yield() catch {};
+    joined.store(true, .release);
+}
+
+// A worker that cannot complete until finish requests cancellation. The release
+// assertion observes its completion before any continuation, with no disk or GPU.
+fn interleavePendingRead(joined: *std.atomic.Value(bool)) !*engram.Prefetch {
+    const width = region_rows + 1;
+    const pf = try engram.Prefetch.start(testing.allocator, &.{}, &.{.{ .at = width, .len = width, .ids = &.{} }}, 1, width);
+    pf.thread.?.join();
+    pf.thread = null;
+    errdefer pf.finish();
+    pf.thread = try std.Thread.spawn(.{}, interleaveWaitForStop, .{ pf, joined });
+    return pf;
+}
+
+fn interleaveArmCpu(host: *InterleavePlugin.Model, prompt: []const u32) !void {
+    const begin = InterleavePlugin.table.cache.aux.?.begin_prompt;
+    try testing.expect(begin(host, 1, .of(prompt), .{}, region_rows + 1, false).isOk());
+}
+
+fn interleaveAddOther(host: *InterleavePlugin.Model, parked_owner: bool) !void {
+    const other: State = .{ .gpa = testing.allocator, .layers = &.{}, .n = region_rows + 1 };
+    try host.parked.put(std.heap.c_allocator, 2, .{ .st = other, .gen = 2 });
+    if (parked_owner) try testing.expect(InterleavePlugin.table.activate_slot.?(host, 2).isOk());
+}
+
+test "dsv41 engram interleave: cancelling the prompt owner joins its lookahead, active or parked, with aux or legacy release" {
+    const width = region_rows + 1;
+    const prompt: [2 * width]u32 = @splat(7);
+    for ([_]bool{ false, true }) |legacy| for ([_]bool{ false, true }) |parked_owner| {
+        var m: Dsv41Model = undefined;
+        interleaveCpuModel(&m, testing.allocator);
+        var host: InterleavePlugin.Model = undefined;
+        interleaveHost(&m, &host);
+        defer interleaveHostCleanup(&host);
+        try interleaveArmCpu(&host, &prompt);
+        try interleaveAddOther(&host, parked_owner);
+        host.bank_streams = legacy;
+        var joined = std.atomic.Value(bool).init(false);
+        m.ahead = try interleavePendingRead(&joined);
+        InterleavePlugin.table.release_slot.?(&host, 1);
+        try testing.expect(m.ahead == null);
+        try testing.expectEqual(@as(usize, 0), m.prompt.len);
+        try testing.expect(joined.load(.acquire));
+        // Continued narrow calls after cancellation have no abandoned lookahead.
+        var survivor: State = .{ .gpa = testing.allocator, .layers = &.{}, .n = width };
+        defer survivor.deinit();
+        const current = try engramPrefetch(&m, testing.allocator, &survivor, &.{}, &.{7}, &.{}, width, false);
+        current.finish();
+        try testing.expect(m.ahead == null);
+        InterleavePlugin.table.release_slot.?(&host, 1); // repeated release is harmless
+    };
+}
+
+test "dsv41 engram interleave: cancelling another slot preserves the prompt lookahead through continued narrow calls" {
+    const width = region_rows + 1;
+    const prompt: [2 * width]u32 = @splat(7);
+    for ([_]bool{ false, true }) |legacy| for ([_]bool{ false, true }) |parked_owner| {
+        var m: Dsv41Model = undefined;
+        interleaveCpuModel(&m, testing.allocator);
+        var host: InterleavePlugin.Model = undefined;
+        interleaveHost(&m, &host);
+        defer interleaveHostCleanup(&host);
+        try interleaveArmCpu(&host, &prompt);
+        try interleaveAddOther(&host, parked_owner);
+        host.bank_streams = legacy;
+        var joined = std.atomic.Value(bool).init(false);
+        const ahead = try interleavePendingRead(&joined);
+        m.ahead = ahead;
+        InterleavePlugin.table.release_slot.?(&host, 2);
+        try testing.expect(m.ahead == ahead);
+        try testing.expectEqualSlices(u32, &prompt, m.prompt);
+        try testing.expect(!joined.load(.acquire));
+        var survivor: State = .{ .gpa = testing.allocator, .layers = &.{}, .n = width };
+        defer survivor.deinit();
+        const current = try engramPrefetch(&m, testing.allocator, &survivor, &.{}, &.{7}, &.{}, width, false);
+        try testing.expect(current != ahead);
+        current.finish();
+        try testing.expect(m.ahead == ahead);
+        InterleavePlugin.table.release_slot.?(&host, 1);
+        try testing.expect(m.ahead == null);
+        try testing.expect(joined.load(.acquire));
+    };
+}
+
+test "dsv41 engram interleave: prompt ownership follows successful handoff and a reused slot" {
+    const width = region_rows + 1;
+    const prompt: [2 * width]u32 = @splat(7);
+    for ([_]bool{ false, true }) |parked_owner| {
+        var m: Dsv41Model = undefined;
+        interleaveCpuModel(&m, testing.allocator);
+        var host: InterleavePlugin.Model = undefined;
+        interleaveHost(&m, &host);
+        defer interleaveHostCleanup(&host);
+        try interleaveArmCpu(&host, &prompt);
+        try interleaveAddOther(&host, parked_owner);
+        var joined = std.atomic.Value(bool).init(false);
+        const ahead = try interleavePendingRead(&joined);
+        m.ahead = ahead;
+        const handoff = InterleavePlugin.table.cache.aux.?.handoff;
+        try testing.expect(!handoff(&host, 1, 2).isOk()); // busy destination
+        try testing.expect(!handoff(&host, 9, 3).isOk()); // no source
+        try testing.expect(m.ahead == ahead);
+        try testing.expect(handoff(&host, 1, 3).isOk());
+        InterleavePlugin.table.release_slot.?(&host, 1);
+        try testing.expect(m.ahead == ahead);
+        try testing.expect(!joined.load(.acquire));
+        InterleavePlugin.table.release_slot.?(&host, 3);
+        try testing.expect(m.ahead == null);
+        try testing.expect(joined.load(.acquire));
+
+        // Reusing the old slot establishes a new association; cancelling slot2
+        // cannot discard its new prompt, but releasing slot1 must do so.
+        try testing.expect(InterleavePlugin.table.activate_slot.?(&host, 1).isOk());
+        if (m.dec_state == null) m.dec_state = .{ .gpa = testing.allocator, .layers = &.{}, .n = width };
+        try interleaveArmCpu(&host, &prompt);
+        joined.store(false, .release);
+        const reused = try interleavePendingRead(&joined);
+        m.ahead = reused;
+        InterleavePlugin.table.release_slot.?(&host, 2);
+        try testing.expect(m.ahead == reused);
+        InterleavePlugin.table.release_slot.?(&host, 1);
+        try testing.expect(m.ahead == null);
+        try testing.expect(joined.load(.acquire));
+    }
+}
+
+test "dsv41 engram interleave: failed prompt capture discards partial prompt before cold continuation" {
+    const width = region_rows + 1;
+    const prompt: [2 * width]u32 = @splat(7);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var m: Dsv41Model = undefined;
+    interleaveCpuModel(&m, failing.allocator());
+    var host: InterleavePlugin.Model = undefined;
+    interleaveHost(&m, &host);
+    defer interleaveHostCleanup(&host);
+    try interleaveArmCpu(&host, &prompt);
+    var joined = std.atomic.Value(bool).init(false);
+    m.ahead = try interleavePendingRead(&joined);
+    const begin = InterleavePlugin.table.cache.aux.?.begin_prompt;
+    // m.gpa can duplicate the prompt; the state's allocator fails snap_ids next.
+    try testing.expect(!begin(&host, 1, .of(&prompt), .{}, width, true).isOk());
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(m.ahead == null);
+    try testing.expect(joined.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), m.prompt.len);
+    var survivor: State = .{ .gpa = testing.allocator, .layers = &.{}, .n = 0 };
+    defer survivor.deinit();
+    const current = try engramPrefetch(&m, testing.allocator, &survivor, &.{}, prompt[0..width], &.{}, width, false);
+    current.finish();
+    try testing.expect(m.ahead == null);
+    InterleavePlugin.table.release_slot.?(&host, 1);
+}
+
+test "dsv41 engram interleave: slot cancellation after aux or legacy prompt setup preserves finite exact continuation logits (DSV41_TINY)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const root = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    var t = try Tiny.open(root, "repack", "fixture.safetensors");
+    defer t.deinit();
+    const base = try t.ids();
+    defer gpa.free(base);
+    const m = t.m;
+    const width = region_rows + 1;
+    var prompt: [2 * width]u32 = undefined;
+    for (&prompt, 0..) |*id, k| id.* = base[k % base.len];
+    var other_prompt = prompt;
+    other_prompt[width - 1] = (other_prompt[width - 1] + 1) % @as(u32, @intCast(m.vocab));
+    var isolated = try initState(m, gpa);
+    defer isolated.deinit();
+    _ = mlx.mlx_array_free(try extend(m, gpa, &isolated, other_prompt[0..width], .last));
+    const reference = try extend(m, gpa, &isolated, prompt[width..][0..4], .all);
+    defer _ = mlx.mlx_array_free(reference);
+    const expected = try hostF32(reference);
+    defer gpa.free(expected);
+    for ([_]bool{ false, true }) |legacy| for ([_]bool{ false, true }) |parked_owner| {
+        var host: InterleavePlugin.Model = undefined;
+        interleaveHost(m, &host);
+        defer interleaveHostCleanup(&host);
+        {
+            var other = try initState(m, gpa);
+            errdefer other.deinit();
+            _ = mlx.mlx_array_free(try extend(m, gpa, &other, other_prompt[0..width], .last));
+            try host.parked.put(std.heap.c_allocator, 2, .{ .st = other, .gen = m.gens + 1 });
+        }
+        m.gens += 1;
+        if (legacy) {
+            host.bank_streams = true;
+            try testing.expectEqual(@as(u64, 0), InterleavePlugin.resumePrompt(&host, 1, .of(&prompt), .{}));
+        } else {
+            const begin = InterleavePlugin.table.cache.aux.?.begin_prompt;
+            try testing.expect(begin(&host, 1, .of(&prompt), .{}, 0, false).isOk());
+        }
+        _ = mlx.mlx_array_free(try extend(m, gpa, &m.dec_state.?, prompt[0..width], .last));
+        try testing.expect(m.ahead != null);
+        if (parked_owner) try testing.expect(InterleavePlugin.table.activate_slot.?(&host, 2).isOk());
+        InterleavePlugin.table.release_slot.?(&host, 1);
+        try testing.expect(m.ahead == null);
+        try testing.expectEqual(@as(usize, 0), m.prompt.len);
+        const survivor = if (host.owner == 2) &m.dec_state.? else &host.parked.getPtr(2).?.st;
+        const decoded = try extend(m, gpa, survivor, prompt[width..][0..4], .all);
+        defer _ = mlx.mlx_array_free(decoded);
+        const got = try hostF32(decoded);
+        defer gpa.free(got);
+        try interleaveExactLogits(expected, got);
+    };
 }

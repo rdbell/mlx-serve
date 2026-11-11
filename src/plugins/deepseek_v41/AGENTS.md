@@ -70,6 +70,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   reference); the module splices the rows itself; image rows route by `gate.bias_vl` and get no Engram write
   (`Hash.DEAD`).
 - The resume key includes the image rows: a different image at the same tokens is a cold prompt.
+- Engram lookahead belongs to its armed state generation, including while parked; matching tokens, positions
+  or call widths do not identify its owner. The owning slot release joins the reader before freeing prompt ids.
 - DSpark = DFlash + Markov head: `block_size` at ROOT; `rope_is_neox_style:false` = MLX `traditional=true`; `w1`
   DENSE; sampled requests via one-hot acceptance. Per-model `mtp:false` keeps the
   stages off (`mtpSetting`).

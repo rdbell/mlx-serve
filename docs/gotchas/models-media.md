@@ -798,3 +798,13 @@ Defect: ISTA-DASLab's Q2_0 Flash Next pack answered `!!` on the MLX GGUF path wh
 split-layout types (`packedRows`), so two Q6_K `ssm_out` layers fed the kernels a wrong layout; any qwen35 GGUF with a
 split-type out_proj and r > 1 had it too. Found by loading one tensor class raw at a time, the rest as 8-bit affine.
 Fix: the branch packs too. Guard: `a tiled-input weight of a split-layout type loads in the kernels' layout`.
+
+## DeepSeek V4.1 Engram read-ahead ownership
+
+A decode or verify could adopt or cancel a parked prompt's Engram read-ahead when
+its current tokens and positions matched despite a different history. Tracking
+only call width also prevented the owner's short snapshot remainder from
+consuming its own lookahead. Bind the armed prompt to its state generation and
+track its slot through parking, handoff and release. Join the reader before
+freeing prompt ids. The `dsv41 engram interleave` regressions cover collisions
+and release; the cold chunk comparison covers uniform and snapshot-split tails.

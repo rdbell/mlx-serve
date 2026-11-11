@@ -98,6 +98,8 @@ pub const Model = struct {
     /// The slot whose state is `mdl.dec_state` (0: none claimed it yet, a resumed state or the module's own); every
     /// other live slot's waits in `parked`. Excluded configurations keep the last finished state in `idle`.
     owner: u32 = 0,
+    /// The slot whose armed prompt owns the module's lookahead, even while parked.
+    prompt_owner: u32 = 0,
     parked: std.AutoHashMapUnmanaged(u32, Kept) = .empty,
     idle: ?Kept = null,
     /// The last id a snapshot was given for the other tensor ranks (`Snap.tp_id`).
@@ -161,6 +163,10 @@ fn activate(m: *Model, slot: u32) !void {
 
 fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
+    if (slot != 0 and slot == m.prompt_owner) {
+        m.mdl.clearPrompt();
+        m.prompt_owner = 0;
+    }
     if (!auxEnabled(mp)) {
         if (slot == m.owner) {
             m.owner = 0;
@@ -298,6 +304,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.bank = null;
     m.bank_streams = false;
     m.owner = 0;
+    m.prompt_owner = 0;
     m.parked = .empty;
     m.idle = null;
     if (c.dsv41_streamed) {
@@ -567,11 +574,17 @@ pub fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows
         m.mdl.state_gen = k.gen;
         m.idle = null;
     };
-    return dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch blk: {
+    const n = dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch {
+        // A failed arm may already have replaced the prompt. Cold forward must
+        // not create lookahead from partial or previously armed prompt tokens.
+        m.mdl.clearPrompt();
+        m.prompt_owner = 0;
         // The forward at position 0 establishes the cold state even if this reset fails.
         dsv41.reset(m.mdl, gpa) catch {};
-        break :blk 0;
+        return 0;
     };
+    m.prompt_owner = slot;
+    return n;
 }
 
 /// `CacheHooks.state_bytes`: the bytes the request's state holds on the GPU, for the engine's cache budget.
@@ -646,7 +659,12 @@ fn auxBeginPrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), rows: abi.Ar
     if (restored_at == 0) {
         dsv41.reset(m.mdl, gpa) catch |e| return Verdict.named(.failed, @errorName(e));
     }
-    dsv41.armPrompt(m.mdl, prompt.slice(), if (rows.ctx != null) .{ .ctx = rows.ctx } else null, capture) catch |e| return Verdict.named(.failed, @errorName(e));
+    dsv41.armPrompt(m.mdl, prompt.slice(), if (rows.ctx != null) .{ .ctx = rows.ctx } else null, capture) catch |e| {
+        m.mdl.clearPrompt();
+        m.prompt_owner = 0;
+        return Verdict.named(.failed, @errorName(e));
+    };
+    m.prompt_owner = slot;
     return .ok;
 }
 
@@ -726,11 +744,12 @@ fn auxHandoff(mp: *anyopaque, from: u32, to: u32) callconv(.c) Verdict {
     if (liveState(m, from) == null) return Verdict.refuse(.failed, "deepseek_v41: handoff source has no state");
     if (from == m.owner) {
         m.owner = to;
-        return .ok;
+    } else {
+        m.parked.ensureUnusedCapacity(gpa, 1) catch |e| return Verdict.named(.failed, @errorName(e));
+        const kept = m.parked.fetchRemove(from).?.value;
+        m.parked.putAssumeCapacity(to, kept);
     }
-    m.parked.ensureUnusedCapacity(gpa, 1) catch |e| return Verdict.named(.failed, @errorName(e));
-    const kept = m.parked.fetchRemove(from).?.value;
-    m.parked.putAssumeCapacity(to, kept);
+    if (m.prompt_owner == from) m.prompt_owner = to;
     return .ok;
 }
 
