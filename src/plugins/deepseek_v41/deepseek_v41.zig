@@ -9553,38 +9553,50 @@ test "dsv41 CED resume: a prompt that extends the last one replays the tail a co
 }
 
 test "dsv41 engram: a chunk's rows are read behind the one before it and give the same logits (DSV41_TINY)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const root = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
     const gpa = testing.allocator;
-    var t = try Tiny.open(root, "repack", "fixture.safetensors");
-    defer t.deinit();
-    const base = try t.ids();
-    defer gpa.free(base);
-    const m = t.m;
     // Three chunks, each wider than `region_rows`, so every one has a wide chunk to read ahead for.
     const cuts = [_]usize{ region_rows + 1, 2 * (region_rows + 1), 3 * (region_rows + 1) };
     const ids = try gpa.alloc(u32, cuts[2]);
     defer gpa.free(ids);
-    for (ids, 0..) |*id, k| id.* = base[k % base.len];
-    var logits: [2][]f32 = undefined;
-    for (&logits, 0..) |*out, ahead| {
-        _ = try resumePrompt(m, ids, null);
-        if (ahead == 0) { // the prompt is unknown: every chunk reads its own rows
-            m.gpa.free(m.prompt);
-            m.prompt = &.{};
+    for ([_]bool{ false, true }) |capture| {
+        var logits: [2]?[]f32 = .{ null, null };
+        defer for (logits) |l| if (l) |values| gpa.free(values);
+        for (&logits, 0..) |*out, ahead| {
+            // Each arm starts cold: reusing a model can restore the first arm's
+            // snapshot and change the last chunk's 16+1 split into a single 17.
+            var t = try Tiny.open(root, "repack", "fixture.safetensors");
+            defer t.deinit();
+            const base = try t.ids();
+            defer gpa.free(base);
+            for (ids, 0..) |*id, k| id.* = base[k % base.len];
+            const m = t.m;
+            if (capture) {
+                try testing.expectEqual(@as(usize, 0), try resumePrompt(m, ids, null));
+                try testing.expectEqual(@as(?usize, ids.len - 1), m.dec_state.?.snap_at);
+            } else {
+                try reset(m, gpa);
+                try armPrompt(m, ids, null, false);
+                try testing.expect(m.dec_state.?.snap_at == null);
+            }
+            if (ahead == 0) { // the prompt is unknown: every chunk reads its own rows
+                m.gpa.free(m.prompt);
+                m.prompt = &.{};
+            }
+            var lo: usize = 0;
+            for (cuts, 0..) |hi, c| {
+                const l = if (c == 0) try prefill(m, gpa, ids[lo..hi], null) else try extendResumable(m, gpa, ids[lo..hi], null);
+                defer _ = mlx.mlx_array_free(l);
+                if (c + 1 == cuts.len) out.* = try hostF32(l);
+                // After a chunk, the next one's rows are coming; after the last, nothing.
+                try testing.expectEqual(ahead == 1 and c + 1 < cuts.len, m.ahead != null);
+                if (m.ahead) |a| try testing.expect(a.covers(hi, @min(cuts[c + 1] - hi, hi - lo)));
+                lo = hi;
+            }
         }
-        var lo: usize = 0;
-        for (cuts, 0..) |hi, c| {
-            const l = if (c == 0) try prefill(m, gpa, ids[lo..hi], null) else try extendResumable(m, gpa, ids[lo..hi], null);
-            defer _ = mlx.mlx_array_free(l);
-            if (c + 1 == cuts.len) out.* = try hostF32(l);
-            // After a chunk, the next one's rows are coming; after the last, nothing.
-            try testing.expectEqual(ahead == 1 and c + 1 < cuts.len, m.ahead != null);
-            if (m.ahead) |a| try testing.expect(a.covers(hi, @min(cuts[c + 1] - hi, hi - lo)));
-            lo = hi;
-        }
+        try testing.expectEqualSlices(f32, logits[0].?, logits[1].?);
     }
-    defer for (logits) |l| gpa.free(l);
-    try testing.expectEqualSlices(f32, logits[0], logits[1]);
 }
 
 test "dsv41 init: every weight the model reads is evaluated before a region traces it (DSV41_TINY)" {
