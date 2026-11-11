@@ -354,7 +354,10 @@ pub fn expectBatched(p: *Pair) !void {
     var lane_buf: [2][2]Lane = undefined;
     const lanes = lane_buf[0..xs.len];
     for (lanes, xs) |*pair, x| for (pair) |*l| try l.init(x);
-    defer for (lanes) |*pair| for (pair) |*l| l.deinit();
+    defer for (lanes, xs) |*pair, x| {
+        x.ssm_group.deinit();
+        for (pair) |*l| l.deinit();
+    };
     for ([_][]const i32{ &ids(20, 3), &ids(7, 9) }, 0..) |pr, j| {
         var g = ops.Graph.init(a, s);
         defer g.deinit();
