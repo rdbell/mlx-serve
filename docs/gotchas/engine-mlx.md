@@ -1466,3 +1466,11 @@ preflight refuses the setting without it) and two SDK calls every MoE on the sha
 no error): `openPack` takes GPU streams only. Guard: `residentModelDiskBytes: with stream_experts ...`, the
 conformance suite's streamed check, `mlx pack: a pack opened on a CPU stream is refused by name`.
 
+
+### A logprobs peak bound omitted the Metal sort's small buffers
+Defect: the prompt-logprobs memory regression failed even with no retained vocabulary-wide intermediate.
+Cause: Metal argpartition holds six full matrices plus merge partitions and row/top-k buffers; cached
+buffers can also exceed their requested lengths. Fix: derive the small-buffer budget and page rounding,
+disable cache reuse only for the Metal measurement and restore its limit afterward. Keep other backends'
+bar. Guard: the ordinary call fits, a physically allocated extra matrix breaches the same bar, and both
+arms produce identical logprob bits and token ids.

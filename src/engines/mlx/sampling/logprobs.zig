@@ -74,7 +74,7 @@ fn rankedBefore(_: void, a: TokenLogprob, b: TokenLogprob) bool {
 /// the vocab scores -100. log_softmax is a per-row shift, so ranks and gathers read the f32
 /// logits and only the gathered values subtract the row's logsumexp. Every intermediate
 /// handle is gone before the one eval, so the peak is the top-k argpartition: its f32
-/// input, its indices and the sort's scratch, five [rows, V] 4-byte arrays (none at top_n 0).
+/// input, its indices and the sort's scratch: six [rows, V] 4-byte arrays plus small buffers on Metal (no sort at top_n 0).
 fn rowLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen: []const u32, top_n: u32, s: mlx.mlx_stream, out: *std.ArrayList(LogprobResult)) !void {
     const shape = mlx.getShape(logits);
     const rows: c_int = @intCast(chosen.len);
@@ -235,13 +235,22 @@ test "computeLogprobs: an id past the vocab reports -100, top_n 0 lists none, [1
     try testing.expectEqual(@as(u32, 1), d.top_logprobs[2].token_id);
 }
 
-test "promptLogprobs: no vocab-wide array outlives its use, so the top-k sort is the peak" {
-    // Over the bar on GitHub's virtual GPU: https://github.com/ddalcu/mlx-serve/actions/runs/40896964158
+test "promptLogprobs: peak fits sort scratch without a retained vocab buffer" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     const rows = 64;
     const vocab = 65536;
+    const top_n = 5;
+    const metal = mlx.metalKernelsAvailable();
+    const matrix_bytes = rows * vocab * @sizeOf(f32);
+    const page = std.heap.pageSize();
+    const blocks = std.math.divCeil(usize, vocab, 512 * 4) catch unreachable;
+    var budget: usize = 0;
+    // Six matrices, merge partitions, four row buffers and three top-k buffers.
+    for ([_][2]usize{ .{ matrix_bytes, 6 }, .{ rows * (blocks + 1) * 4, 1 }, .{ rows * 4, 4 }, .{ rows * top_n * 4, 3 } }) |part| {
+        budget += part[1] * (if (part[0] > page) std.mem.alignForward(usize, part[0], page) else part[0]);
+    }
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
     try mlx.check(mlx.mlx_random_key(&key, 7));
@@ -251,21 +260,63 @@ test "promptLogprobs: no vocab-wide array outlives its use, so the top-k sort is
     try mlx.check(mlx.mlx_array_eval(logits));
     var ids: [rows]u32 = undefined;
     for (&ids, 0..) |*v, i| v.* = @intCast(i * 997 % vocab);
-    var out: std.ArrayList(LogprobResult) = .empty;
-    defer {
-        for (out.items) |r| allocator.free(r.top_logprobs);
-        out.deinit(allocator);
+    // Cached allocations may exceed requested sizes; measure without reuse.
+    var old_limit: usize = 0;
+    if (metal) try mlx.check(mlx.mlx_set_cache_limit(&old_limit, 0));
+    defer if (metal) {
+        var ignored: usize = 0;
+        mlx.check(mlx.mlx_set_cache_limit(&ignored, old_limit)) catch @panic("unable to restore MLX test cache limit");
+    };
+    var chosen_reference: [rows]f32 = undefined;
+    var top_reference: [rows][top_n]TokenLogprob = undefined;
+    const arms: []const bool = if (metal) &.{ false, true } else &.{false};
+    for (arms) |plant| {
+        if (metal) {
+            try mlx.check(mlx.mlx_synchronize(s));
+            try mlx.check(mlx.mlx_clear_cache());
+        }
+        var base: usize = 0;
+        try mlx.check(mlx.mlx_get_active_memory(&base));
+        try mlx.check(mlx.mlx_reset_peak_memory());
+        var extra = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(extra);
+        if (plant) {
+            try mlx.check(mlx.mlx_arange(&extra, 0, rows * vocab, 1, .float32, s));
+            try mlx.check(mlx.mlx_array_eval(extra));
+            try mlx.check(mlx.mlx_synchronize(s));
+            var live: usize = 0;
+            try mlx.check(mlx.mlx_get_active_memory(&live));
+            try testing.expect(live >= base);
+            try testing.expectEqual(@as(usize, matrix_bytes), live - base);
+        }
+        var out: std.ArrayList(LogprobResult) = .empty;
+        defer {
+            for (out.items) |r| allocator.free(r.top_logprobs);
+            out.deinit(allocator);
+        }
+        try promptLogprobs(allocator, logits, &ids, top_n, s, &out);
+        if (metal) try mlx.check(mlx.mlx_synchronize(s));
+        var peak: usize = 0;
+        try mlx.check(mlx.mlx_get_peak_memory(&peak));
+        const within_budget = peak >= base and (if (metal) peak - base <= budget else peak - base < 6 * matrix_bytes);
+        if (within_budget == plant) std.debug.print("logprobs peak: base={d} peak={d} budget={d} planted={}\n", .{ base, peak, budget, plant });
+        try testing.expectEqual(!plant, within_budget);
+        try testing.expectEqual(@as(usize, rows), out.items.len);
+        for (out.items, 0..) |r, i| {
+            try testing.expect(std.math.isFinite(r.token_logprob));
+            try testing.expectEqual(@as(usize, top_n), r.top_logprobs.len);
+            for (r.top_logprobs, 0..) |t, j| {
+                try testing.expect(t.token_id < vocab and std.math.isFinite(t.logprob));
+                if (plant) {
+                    try testing.expectEqual(top_reference[i][j].token_id, t.token_id);
+                    try testing.expectEqual(@as(u32, @bitCast(top_reference[i][j].logprob)), @as(u32, @bitCast(t.logprob)));
+                } else top_reference[i][j] = t;
+            }
+            if (plant) {
+                try testing.expectEqual(@as(u32, @bitCast(chosen_reference[i])), @as(u32, @bitCast(r.token_logprob)));
+            } else chosen_reference[i] = r.token_logprob;
+        }
     }
-
-    var base: usize = 0;
-    try mlx.check(mlx.mlx_get_active_memory(&base));
-    _ = mlx.mlx_reset_peak_memory();
-    try promptLogprobs(allocator, logits, &ids, 5, s, &out);
-    var peak: usize = 0;
-    try mlx.check(mlx.mlx_get_peak_memory(&peak));
-    // Bar: under six [rows, vocab] 4-byte arrays above what was live before (the sort alone holds five).
-    try testing.expect(peak - base < 6 * rows * vocab * 4);
-    try testing.expectEqual(@as(usize, rows), out.items.len);
 }
 
 test "promptLogprobs: every row scores its NEXT token, ranks tie on the lower id" {
